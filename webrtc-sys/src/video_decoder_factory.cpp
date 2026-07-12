@@ -39,6 +39,10 @@
 #include "nvidia/nvidia_decoder_factory.h"
 #endif
 
+#if defined(USE_MF_VIDEO_CODEC)
+#include "mf/mf_decoder_factory.h"
+#endif
+
 namespace livekit_ffi {
 
 namespace {
@@ -89,6 +93,12 @@ VideoDecoderFactory::VideoDecoderFactory()
     RTC_LOG(LS_WARNING) << "Internal H264 decoder is unavailable, "
                            "not advertising its formats";
   }
+
+#if defined(USE_MF_VIDEO_CODEC)
+  if (webrtc::MFVideoDecoderFactory::IsSupported()) {
+    factories_.push_back(std::make_unique<webrtc::MFVideoDecoderFactory>());
+  }
+#endif
 }
 
 std::vector<webrtc::SdpVideoFormat> VideoDecoderFactory::GetSupportedFormats()
