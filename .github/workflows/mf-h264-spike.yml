@@ -1,0 +1,68 @@
+# Livenalt ticket #199 spike: build the Media Foundation H264 encoder shim in
+# webrtc-sys against LiveKit's pinned prebuilt libwebrtc and time it. This is
+# the one place fork CI builds the C++ shim (fork-ci.yml never does, DOCS_RS=1).
+# It still never builds libwebrtc itself: webrtc-sys downloads the prebuilt.
+#
+# Manual by intent. The push trigger exists only so GitHub registers a
+# workflow that lives on a non-default branch; it is path-filtered to the spike.
+# This fork is public, so its runners have 4 vCPU; `jobs` (default 2) caps cargo
+# and the cc jobserver to approximate the 2 vCPU runners of the private repo.
+name: MF H264 spike build
+
+on:
+  workflow_dispatch:
+    inputs:
+      jobs:
+        description: "cargo -j (2 approximates a 2 vCPU runner)"
+        default: "2"
+  push:
+    branches: ["livenalt/spike-mf-h264"]
+    paths:
+      - "webrtc-sys/src/mf/**"
+      - "webrtc-sys/build.rs"
+      - "libwebrtc/tests/mf_h264_spike.rs"
+      - ".github/workflows/mf-h264-spike.yml"
+
+concurrency:
+  group: mf-h264-spike-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Runner
+        shell: bash
+        run: |
+          echo "logical processors: $NUMBER_OF_PROCESSORS"
+          powershell -NoProfile -Command "Get-CimInstance Win32_Processor | Select Name,NumberOfCores,NumberOfLogicalProcessors | Format-List"
+      - name: Install the pinned toolchain
+        shell: bash
+        run: rustup show active-toolchain || rustup toolchain install
+      # Cold on purpose: no rust-cache, so the timing includes the prebuilt
+      # download, all Rust dependencies and the full webrtc-sys C++ shim.
+      - name: Build libwebrtc, webrtc-sys and the spike test (timed)
+        shell: bash
+        run: |
+          start=$(date +%s)
+          cargo build -p libwebrtc --tests --locked -j "${{ inputs.jobs || '2' }}"
+          echo "BUILD_SECONDS=$(( $(date +%s) - start ))" | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Incremental rebuild after touching the MF encoder (timed)
+        shell: bash
+        run: |
+          touch webrtc-sys/src/mf/h264_encoder_impl.cpp
+          start=$(date +%s)
+          cargo build -p libwebrtc --tests --locked -j "${{ inputs.jobs || '2' }}"
+          echo "REBUILD_SECONDS=$(( $(date +%s) - start ))" | tee -a "$GITHUB_STEP_SUMMARY"
+      # Links the full shim (mfplat, mfuuid, mf, dxguid) into a test binary and
+      # runs the pure-Rust harness tests; the GPU tests are #[ignore].
+      - name: Spike harness pure tests
+        shell: bash
+        run: cargo test -p libwebrtc --test mf_h264_spike --locked -j "${{ inputs.jobs || '2' }}"
