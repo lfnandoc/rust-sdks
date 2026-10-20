@@ -148,6 +148,30 @@ H264Level ProbeMaxLevel(IMFTransform* transform) {
   return H264Level::kLevel3_1;
 }
 
+// True when the MFT takes 3 temporal layers (CODECAPI_AVEncVideoTemporalLayerCount
+// with a range reaching 3), so L1T2/L1T3 can be advertised alongside L1T1.
+bool ProbeTemporalLayers(IMFTransform* transform) {
+  ComPtr<ICodecAPI> api;
+  if (FAILED(transform->QueryInterface(IID_PPV_ARGS(&api)))) {
+    return false;
+  }
+  if (api->IsSupported(&CODECAPI_AVEncVideoTemporalLayerCount) != S_OK) {
+    RTC_LOG(LS_INFO) << "Encoder MFT has no temporal layer control; "
+                        "advertising L1T1 only.";
+    return false;
+  }
+  VARIANT lo = {}, hi = {}, step = {};
+  if (SUCCEEDED(api->GetParameterRange(&CODECAPI_AVEncVideoTemporalLayerCount,
+                                       &lo, &hi, &step)) &&
+      hi.vt == VT_UI4 && hi.ulVal < 3) {
+    RTC_LOG(LS_INFO) << "Encoder MFT supports " << hi.ulVal
+                     << " temporal layers; advertising L1T1 only.";
+    return false;
+  }
+  RTC_LOG(LS_INFO) << "Encoder MFT supports 3 temporal layers.";
+  return true;
+}
+
 }  // namespace
 
 MFVideoEncoderFactory::MFVideoEncoderFactory() {
@@ -161,8 +185,10 @@ MFVideoEncoderFactory::MFVideoEncoderFactory() {
   // negotiated. Baseline-family only for now, matching the software H264
   // default; High is a possible later addition.
   const H264Level level = ProbeMaxLevel(probe.transform.Get());
+  const bool temporal_layers = ProbeTemporalLayers(probe.transform.Get());
   supported_formats_.push_back(CreateH264Format(
-      H264Profile::kProfileConstrainedBaseline, level, "1"));
+      H264Profile::kProfileConstrainedBaseline, level, "1",
+      /*add_scalability_modes=*/temporal_layers));
 }
 
 MFVideoEncoderFactory::~MFVideoEncoderFactory() {}
