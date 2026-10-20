@@ -24,8 +24,10 @@
 #include <common_video/h264/h264_common.h>
 #include "common_video/libyuv/include/webrtc_libyuv.h"
 #include "mf_common.h"
+#include "modules/video_coding/codecs/interface/common_constants.h"
 #include "modules/video_coding/include/video_codec_interface.h"
 #include "modules/video_coding/include/video_error_codes.h"
+#include "modules/video_coding/svc/scalability_mode_util.h"
 #include "modules/video_coding/utility/simulcast_rate_allocator.h"
 #include "rtc_base/checks.h"
 #include "rtc_base/logging.h"
@@ -52,7 +54,9 @@ constexpr int kNeedInputTimeoutMs = 500;
 constexpr int kOutputWaitTimeoutMs = 500;
 // How many frames may be in flight inside the MFT before Encode() blocks
 // waiting for output. Low-latency mode keeps this near 1 in practice.
-constexpr size_t kMaxPendingFrames = 4;
+constexpr size_t kMaxPendingFrames = 0;  // SPIKE: was 4; 0 waits for each output.
+// SPIKE: rate control budget per frame follows MF_MT_FRAME_RATE.
+constexpr UINT32 kSpikeFpsCap = 30;
 
 HRESULT SetCodecApiUInt32(ICodecAPI* api, const GUID& guid, UINT32 value) {
   VARIANT v = {};
@@ -206,6 +210,20 @@ int32_t MFH264EncoderImpl::InitEncode(const VideoCodec* inst,
   configuration_.target_bps = codec_.startBitrate * 1000;
   configuration_.max_bps = codec_.maxBitrate * 1000;
 
+  // SimulcastEncoderAdapter hands each layer its own VideoCodec carrying the
+  // layer's scalability mode (L1T3 for every Livenalt encoding).
+  requested_temporal_layers_ = 1;
+  if (std::optional<ScalabilityMode> mode = codec_.GetScalabilityMode()) {
+    requested_temporal_layers_ = ScalabilityModeToNumTemporalLayers(*mode);
+  } else if (codec_.numberOfSimulcastStreams > 0) {
+    requested_temporal_layers_ =
+        codec_.simulcastStream[0].numberOfTemporalLayers;
+  } else {
+    requested_temporal_layers_ = codec_.H264()->numberOfTemporalLayers;
+  }
+  requested_temporal_layers_ = std::clamp(requested_temporal_layers_, 1, 3);
+  first_timestamp_us_ = -1;
+
   if (!livekit_ffi::EnsureComInitialized() || !livekit_ffi::EnsureMFStarted()) {
     ReportError();
     return WEBRTC_VIDEO_CODEC_ERROR;
@@ -225,7 +243,9 @@ int32_t MFH264EncoderImpl::InitEncode(const VideoCodec* inst,
   RTC_LOG(LS_INFO) << "MediaFoundation H264 encoder initialized ("
                    << friendly_name_ << "): " << codec_.width << "x"
                    << codec_.height << " @ " << codec_.maxFramerate
-                   << "fps, target_bps=" << configuration_.target_bps;
+                   << "fps, target_bps=" << configuration_.target_bps
+                   << ", temporal layers " << active_temporal_layers_ << "/"
+                   << requested_temporal_layers_;
 
   SimulcastRateAllocator init_allocator(env_, codec_);
   VideoBitrateAllocation allocation =
@@ -327,7 +347,22 @@ int32_t MFH264EncoderImpl::ConfigureTransform() {
   output_stream_id_ = output_ids[0];
 
   const UINT32 fps =
-      std::max(1u, static_cast<UINT32>(configuration_.max_frame_rate + 0.5f));
+      std::clamp(static_cast<UINT32>(configuration_.max_frame_rate + 0.5f), 1u, kSpikeFpsCap);
+
+  // Temporal layers go in before the media types: NVIDIA's MFT accepts the
+  // count then and reads it back as set (range 1..3). The temporal id of each
+  // output comes back in an SVC prefix NAL unit (type 14).
+  active_temporal_layers_ = 1;
+  if (requested_temporal_layers_ > 1) {
+    HRESULT thr = SetCodecApiUInt32(codec_api_.Get(),
+                                    CODECAPI_AVEncVideoTemporalLayerCount,
+                                    requested_temporal_layers_);
+    if (FAILED(thr)) {
+      RTC_LOG(LS_WARNING) << "Encoder MFT rejected TemporalLayerCount="
+                          << requested_temporal_layers_ << " ("
+                          << HResultToString(thr) << "); encoding L1T1.";
+    }
+  }
 
   // Output type first: encoder MFTs require it before the input type.
   ComPtr<IMFMediaType> output_type;
@@ -391,6 +426,20 @@ int32_t MFH264EncoderImpl::ConfigureTransform() {
     return WEBRTC_VIDEO_CODEC_ERROR;
   }
 
+  if (requested_temporal_layers_ > 1) {
+    VARIANT v = {};
+    if (SUCCEEDED(codec_api_->GetValue(&CODECAPI_AVEncVideoTemporalLayerCount,
+                                       &v)) &&
+        v.vt == VT_UI4 &&
+        v.ulVal == static_cast<ULONG>(requested_temporal_layers_)) {
+      active_temporal_layers_ = requested_temporal_layers_;
+    } else {
+      RTC_LOG(LS_WARNING) << "Encoder MFT did not keep TemporalLayerCount="
+                          << requested_temporal_layers_ << "; encoding L1T1.";
+    }
+  }
+  tl0sync_limit_ = static_cast<uint8_t>(active_temporal_layers_);
+
   // Rate control: CBR at the target bitrate, low latency, no B-frames (webrtc
   // cannot tolerate them), and an effectively infinite GOP since webrtc
   // requests IDR frames itself.
@@ -410,8 +459,18 @@ int32_t MFH264EncoderImpl::ConfigureTransform() {
   hr = SetCodecApiUInt32(codec_api_.Get(),
                          CODECAPI_AVEncMPVDefaultBPictureCount, 0);
   if (FAILED(hr)) {
-    RTC_LOG(LS_ERROR) << "Failed to disable B-frames: " << HResultToString(hr);
-    return WEBRTC_VIDEO_CODEC_ERROR;
+    // NVIDIA's MFT does not implement this property (E_INVALIDARG on set,
+    // E_NOTIMPL on get). Baseline has no B-frames by definition, so only a
+    // profile that allows them makes the rejection fatal.
+    if (profile_ != H264Profile::kProfileConstrainedBaseline &&
+        profile_ != H264Profile::kProfileBaseline) {
+      RTC_LOG(LS_ERROR) << "Failed to disable B-frames: "
+                        << HResultToString(hr);
+      return WEBRTC_VIDEO_CODEC_ERROR;
+    }
+    RTC_LOG(LS_INFO) << "Encoder MFT rejected BPictureCount=0 ("
+                     << HResultToString(hr)
+                     << "); Baseline profile has no B-frames.";
   }
   // Best effort from here on: support varies by vendor/driver.
   if (FAILED(SetCodecApiBool(codec_api_.Get(), CODECAPI_AVLowLatencyMode,
@@ -512,6 +571,12 @@ int32_t MFH264EncoderImpl::RegisterEncodeCompleteCallback(
 }
 
 int32_t MFH264EncoderImpl::Release() {
+  if (encoded_frames_ > 0) {
+    LogTemporalSummary();
+  }
+  encoded_frames_ = 0;
+  untagged_frames_ = 0;
+  std::fill(std::begin(temporal_counts_), std::end(temporal_counts_), 0);
   if (transform_) {
     transform_->ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM,
                                input_stream_id_);
@@ -612,7 +677,7 @@ int32_t MFH264EncoderImpl::PumpEvents(int timeout_ms,
         ReportError();
         return WEBRTC_VIDEO_CODEC_ENCODER_FAILURE;
       }
-      Sleep(1);
+      SwitchToThread();  // SPIKE: Sleep(1) is ~15.6 ms at the default timer resolution.
       continue;
     }
     if (FAILED(hr)) {
@@ -715,7 +780,13 @@ int32_t MFH264EncoderImpl::Encode(
   const int64_t fps =
       std::max<int64_t>(1, static_cast<int64_t>(configuration_.max_frame_rate));
   const int64_t duration_100ns = 10'000'000 / fps;
-  const int64_t sample_time_100ns = frame_count_ * duration_100ns;
+  // Real capture timing, not frame_count / max_frame_rate: webrtc
+  // configures screenshare at 60 fps while capture usually runs at 30.
+  if (first_timestamp_us_ < 0) {
+    first_timestamp_us_ = input_frame.timestamp_us();
+  }
+  const int64_t sample_time_100ns =
+      (input_frame.timestamp_us() - first_timestamp_us_) * 10;
   frame_count_++;
 
   ComPtr<IMFSample> sample;
@@ -904,16 +975,44 @@ int32_t MFH264EncoderImpl::ProcessEncodedFrame(std::vector<uint8_t>& packet) {
 
   bool is_idr = false;
   bool has_sps = false;
+  int temporal_id = -1;
+  bool has_prefix = false;
   std::vector<H264::NaluIndex> nalu_indices =
       H264::FindNaluIndices(packet);
   for (const H264::NaluIndex& index : nalu_indices) {
-    const H264::NaluType nalu_type =
-        H264::ParseNaluType(packet[index.payload_start_offset]);
+    const uint8_t header = packet[index.payload_start_offset];
+    const H264::NaluType nalu_type = H264::ParseNaluType(header);
     if (nalu_type == H264::kIdr) {
       is_idr = true;
     } else if (nalu_type == H264::kSps) {
       has_sps = true;
+    } else if ((header & 0x1F) == 14 || (header & 0x1F) == 20) {
+      // SVC NAL header extension: byte 3 holds temporal_id in its top bits.
+      has_prefix = true;
+      if (index.payload_size >= 4) {
+        temporal_id = (packet[index.payload_start_offset + 3] >> 5) & 0x7;
+      }
     }
+  }
+  // Prefix NALs only carry the temporal id, which reaches the SFU through the
+  // codec-specific info (dependency descriptor) instead; strip them so
+  // receivers get a plain Constrained Baseline stream.
+  if (has_prefix) {
+    static const uint8_t kStartCode[4] = {0, 0, 0, 1};
+    std::vector<uint8_t> stripped;
+    stripped.reserve(packet.size());
+    for (const H264::NaluIndex& index : nalu_indices) {
+      const uint8_t type = packet[index.payload_start_offset] & 0x1F;
+      if (type == 14 || type == 20) {
+        continue;
+      }
+      stripped.insert(stripped.end(), kStartCode, kStartCode + 4);
+      stripped.insert(stripped.end(),
+                      packet.begin() + index.payload_start_offset,
+                      packet.begin() + index.payload_start_offset +
+                          index.payload_size);
+    }
+    packet.swap(stripped);
   }
 
   // Some vendor MFTs do not repeat SPS/PPS on every IDR; the RTP packetizer
@@ -955,6 +1054,35 @@ int32_t MFH264EncoderImpl::ProcessEncodedFrame(std::vector<uint8_t>& packet) {
   codec_info.codecType = kVideoCodecH264;
   codec_info.codecSpecific.H264.packetization_mode =
       H264PacketizationMode::NonInterleaved;
+  codec_info.codecSpecific.H264.temporal_idx = kNoTemporalIdx;
+  codec_info.codecSpecific.H264.idr_frame = is_idr;
+  codec_info.codecSpecific.H264.base_layer_sync = false;
+  encoded_frames_++;
+  if (active_temporal_layers_ > 1) {
+    if (temporal_id >= 0 && temporal_id < active_temporal_layers_) {
+      const uint8_t tid = static_cast<uint8_t>(temporal_id);
+      // Same bookkeeping as webrtc's OpenH264 encoder.
+      codec_info.codecSpecific.H264.temporal_idx = tid;
+      codec_info.codecSpecific.H264.base_layer_sync =
+          tid > 0 && tid < tl0sync_limit_;
+      if (codec_info.codecSpecific.H264.base_layer_sync) {
+        tl0sync_limit_ = tid;
+      }
+      if (tid == 0) {
+        tl0sync_limit_ = static_cast<uint8_t>(active_temporal_layers_);
+      }
+      temporal_counts_[tid]++;
+    } else {
+      untagged_frames_++;
+    }
+  }
+  codec_info.scalability_mode =
+      active_temporal_layers_ == 3   ? ScalabilityMode::kL1T3
+      : active_temporal_layers_ == 2 ? ScalabilityMode::kL1T2
+                                     : ScalabilityMode::kL1T1;
+  if (encoded_frames_ % 300 == 0) {
+    LogTemporalSummary();
+  }
 
   const auto result =
       encoded_image_callback_->OnEncodedImage(encoded_image_, &codec_info);
@@ -963,6 +1091,17 @@ int32_t MFH264EncoderImpl::ProcessEncodedFrame(std::vector<uint8_t>& packet) {
     return WEBRTC_VIDEO_CODEC_ERROR;
   }
   return WEBRTC_VIDEO_CODEC_OK;
+}
+
+void MFH264EncoderImpl::LogTemporalSummary() {
+  RTC_LOG(LS_INFO) << "MF H264 temporal ids " << configuration_.width << "x"
+                   << configuration_.height
+                   << " layers=" << active_temporal_layers_
+                   << " frames=" << encoded_frames_
+                   << " t0=" << temporal_counts_[0]
+                   << " t1=" << temporal_counts_[1]
+                   << " t2=" << temporal_counts_[2]
+                   << " untagged=" << untagged_frames_;
 }
 
 VideoEncoder::EncoderInfo MFH264EncoderImpl::GetEncoderInfo() const {

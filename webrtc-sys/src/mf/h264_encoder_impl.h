@@ -118,6 +118,8 @@ class MFH264EncoderImpl : public VideoEncoder {
 
   void ReportInit();
   void ReportError();
+  // Logs "MF H264 temporal ids WxH layers=N frames=F t0= t1= t2= untagged=".
+  void LogTemporalSummary();
 
   const webrtc::Environment& env_;
 
@@ -144,6 +146,15 @@ class MFH264EncoderImpl : public VideoEncoder {
   LayerConfig configuration_;
   EncodedImage encoded_image_;
   VideoCodec codec_;
+  // Temporal scalability (L1T2/L1T3): what webrtc asked for, and what the
+  // MFT accepted through CODECAPI_AVEncVideoTemporalLayerCount.
+  int requested_temporal_layers_ = 1;
+  int active_temporal_layers_ = 1;
+  uint8_t tl0sync_limit_ = 0;
+  uint64_t temporal_counts_[3] = {0, 0, 0};
+  uint64_t untagged_frames_ = 0;
+  uint64_t encoded_frames_ = 0;
+  int64_t first_timestamp_us_ = -1;
   bool has_reported_init_ = false;
   bool has_reported_error_ = false;
   webrtc::H264BitstreamParser h264_bitstream_parser_;
