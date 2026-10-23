@@ -52,11 +52,19 @@ enum H264EncoderImplEvent {
 // very first request after initialization can lag while the driver spins up.
 constexpr int kNeedInputTimeoutMs = 500;
 constexpr int kOutputWaitTimeoutMs = 500;
-// How many frames may be in flight inside the MFT before Encode() blocks
-// waiting for output. Low-latency mode keeps this near 1 in practice.
-constexpr size_t kMaxPendingFrames = 0;  // SPIKE: was 4; 0 waits for each output.
-// SPIKE: rate control budget per frame follows MF_MT_FRAME_RATE.
-constexpr UINT32 kSpikeFpsCap = 30;
+// How many frames may be in flight inside the MFT when Encode() returns.
+// PR #1282 allowed 4, which collected each output only on the next Encode()
+// call: one frame interval (33 to 40 ms) of added latency. Waiting for the
+// output costs about 3 ms per 1080p frame on NVIDIA (spike #199).
+constexpr size_t kMaxPendingFrames = 0;
+// The MFT's CBR budget per frame follows MF_MT_FRAME_RATE. libwebrtc
+// configures screenshare at 60 fps while capture delivers at most 30, so an
+// uncapped rate made the MFT spend about half its target (spike #199).
+constexpr UINT32 kMaxMfFrameRate = 30;
+// Poll interval while waiting on the MFT. A high-resolution waitable timer
+// sleeps this long without changing the system timer resolution; Sleep(1)
+// would take about 15.6 ms at the default resolution.
+constexpr LONGLONG kPollInterval100ns = 2500;  // 250 us
 
 HRESULT SetCodecApiUInt32(ICodecAPI* api, const GUID& guid, UINT32 value) {
   VARIANT v = {};
@@ -145,6 +153,26 @@ MFH264EncoderImpl::MFH264EncoderImpl(const Environment& env,
 
 MFH264EncoderImpl::~MFH264EncoderImpl() {
   Release();
+  if (poll_timer_) {
+    CloseHandle(poll_timer_);
+  }
+}
+
+void MFH264EncoderImpl::WaitPollInterval() {
+  if (!poll_timer_) {
+    poll_timer_ = CreateWaitableTimerExW(
+        nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+        TIMER_ALL_ACCESS);
+  }
+  LARGE_INTEGER due;
+  due.QuadPart = -kPollInterval100ns;  // negative: relative to now
+  if (poll_timer_ && SetWaitableTimer(poll_timer_, &due, 0, nullptr, nullptr,
+                                      FALSE)) {
+    WaitForSingleObject(poll_timer_, INFINITE);
+  } else {
+    // Windows before 10 1803 has no high-resolution timer: yield instead.
+    SwitchToThread();
+  }
 }
 
 void MFH264EncoderImpl::ReportInit() {
@@ -347,7 +375,7 @@ int32_t MFH264EncoderImpl::ConfigureTransform() {
   output_stream_id_ = output_ids[0];
 
   const UINT32 fps =
-      std::clamp(static_cast<UINT32>(configuration_.max_frame_rate + 0.5f), 1u, kSpikeFpsCap);
+      std::clamp(static_cast<UINT32>(configuration_.max_frame_rate + 0.5f), 1u, kMaxMfFrameRate);
 
   // Temporal layers go in before the media types: NVIDIA's MFT accepts the
   // count then and reads it back as set (range 1..3). The temporal id of each
@@ -677,7 +705,7 @@ int32_t MFH264EncoderImpl::PumpEvents(int timeout_ms,
         ReportError();
         return WEBRTC_VIDEO_CODEC_ENCODER_FAILURE;
       }
-      SwitchToThread();  // SPIKE: Sleep(1) is ~15.6 ms at the default timer resolution.
+      WaitPollInterval();
       continue;
     }
     if (FAILED(hr)) {

@@ -120,6 +120,8 @@ class MFH264EncoderImpl : public VideoEncoder {
   void ReportError();
   // Logs "MF H264 temporal ids WxH layers=N frames=F t0= t1= t2= untagged=".
   void LogTemporalSummary();
+  // Sleeps one poll interval while PumpEvents waits on the MFT.
+  void WaitPollInterval();
 
   const webrtc::Environment& env_;
 
@@ -128,6 +130,7 @@ class MFH264EncoderImpl : public VideoEncoder {
   livekit_ffi::ComPtr<ICodecAPI> codec_api_;
   livekit_ffi::ComPtr<IMFMediaEventGenerator> event_generator_;
   bool is_async_ = false;
+  HANDLE poll_timer_ = nullptr;
   DWORD input_stream_id_ = 0;
   DWORD output_stream_id_ = 0;
   int need_input_credits_ = 0;
