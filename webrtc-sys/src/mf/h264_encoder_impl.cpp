@@ -851,14 +851,26 @@ int32_t MFH264EncoderImpl::Encode(
     return WEBRTC_VIDEO_CODEC_ENCODER_FAILURE;
   }
 
+  int32_t ret;
   if (is_async_) {
     need_input_credits_--;
     // Collect whatever the MFT already produced; block only when too many
     // frames are in flight so encoder latency stays bounded.
-    return PumpEvents(kOutputWaitTimeoutMs, /*until_need_input=*/false,
-                      /*until_pending_at_most=*/kMaxPendingFrames);
+    ret = PumpEvents(kOutputWaitTimeoutMs, /*until_need_input=*/false,
+                     /*until_pending_at_most=*/kMaxPendingFrames);
+  } else {
+    ret = CollectOutputsSync();
   }
-  return CollectOutputsSync();
+  // Nothing in flight means this frame has reached the callback, so a failure
+  // now belongs to the next frame. Encode() must not report it: the callback
+  // already popped the frame's timestamp in SimulcastEncoderAdapter's
+  // StreamContext, a failed Encode() pops again without checking, and
+  // destroying the underflowed deque never returns.
+  if (ret != WEBRTC_VIDEO_CODEC_OK && pending_frames_.empty()) {
+    RTC_LOG(LS_WARNING) << "Encoder MFT failed after delivering a frame: " << ret;
+    return WEBRTC_VIDEO_CODEC_OK;
+  }
+  return ret;
 }
 
 int32_t MFH264EncoderImpl::CollectOutputsSync() {
@@ -1114,9 +1126,11 @@ int32_t MFH264EncoderImpl::ProcessEncodedFrame(std::vector<uint8_t>& packet) {
 
   const auto result =
       encoded_image_callback_->OnEncodedImage(encoded_image_, &codec_info);
+  // A sender refuses frames while it stops (ERROR_SEND_FAILED). The frame was
+  // encoded, so this is not an encoder failure; webrtc's own encoders ignore
+  // this result too.
   if (result.error != EncodedImageCallback::Result::OK) {
-    RTC_LOG(LS_ERROR) << "OnEncodedImage failed " << result.error;
-    return WEBRTC_VIDEO_CODEC_ERROR;
+    RTC_LOG(LS_INFO) << "Sender refused an encoded frame: " << result.error;
   }
   return WEBRTC_VIDEO_CODEC_OK;
 }
