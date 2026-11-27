@@ -351,8 +351,15 @@ int32_t AdmProxy::RegisterAudioCallback(webrtc::AudioTransport* transport) {
 }
 
 int32_t AdmProxy::Init() {
-  // Init is a no-op - the sub ADMs are initialized at creation time
-  return 0;
+  // The synthetic ADM is created initialized, but WebRTC terminates the ADM
+  // when a voice engine is destroyed (the factory builds and drops temporary
+  // engines), and the engine that stays calls Init() again. Re-init it here or
+  // its pump queue is gone for good and no remote audio is ever pulled.
+  // SyntheticAudioDevice::Init is a no-op while initialized.
+  return RunOnWorker([this] {
+    RTC_DCHECK_RUN_ON(worker_thread_);
+    return synthetic_adm_ ? synthetic_adm_->Init() : 0;
+  });
 }
 
 int32_t AdmProxy::Terminate() {
